@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from ts_browser_agent.snapshot import Element, Snapshot
+from wordle_solver.snapshot import Element, Snapshot
 
 
 def _snapshot(elements: list[Element]) -> Snapshot:

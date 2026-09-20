@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from ts_browser_agent.safety import UnsafeURLError, ensure_navigable
+from wordle_solver.safety import UnsafeURLError, ensure_navigable
 
 
 def test_public_address_passes() -> None:

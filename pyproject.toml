@@ -1,7 +1,7 @@
 [project]
-name = "ts-browser-agent"
+name = "wordle-solver"
 version = "0.1.0"
-description = "A fast browser agent built on langchain-typesafe and the LangChain SDK"
+description = "A NYT Wordle solver: a TypeSafe-driven browser agent specialized for Wordle"
 license = "MIT"
 readme = "README.md"
 authors = [
@@ -9,10 +9,8 @@ authors = [
 ]
 requires-python = ">=3.12"
 dependencies = [
-    "deepagents>=0.7.15",
     "langchain>=1.4.1",
     "langchain-core>=1.6.3",
-    "langchain-openai>=1.6.2",
     "langchain-typesafe>=0.0.1a2",
     "playwright>=1.63.0",
     "python-dotenv>=1.2.3",
@@ -27,5 +25,9 @@ dev = [
     "langgraph-cli[inmem]>=0.4.31",
     "mypy>=2.3.1",
     "pytest>=9.1.1",
+    "pytest-asyncio>=1.3.0",
     "ruff>=0.16.8",
 ]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"

@@ -6,7 +6,7 @@ from typing import Any
 
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
-from ts_browser_agent.model import message_text
+from wordle_solver.model import message_text
 
 
 async def run_and_print(agent: Any, goal: str) -> str:

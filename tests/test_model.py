@@ -1,4 +1,4 @@
-"""`TypeSafeBrowserModel` decides from messages alone; drive it with hand-built histories."""
+"""`WordleSolverModel` decides from messages alone; drive it with hand-built histories."""
 
 from __future__ import annotations
 
@@ -8,46 +8,75 @@ from typing import Any
 import pytest
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMessage
 
-from ts_browser_agent import model as model_module
-from ts_browser_agent.decision import Decision
-from ts_browser_agent.model import TypeSafeBrowserModel
-from ts_browser_agent.snapshot import Element, Snapshot
+from wordle_solver import model as model_module
+from wordle_solver.decision import Decision
+from wordle_solver.model import WordleSolverModel
+from wordle_solver.snapshot import Element
+from wordle_solver.wordle import Dialog, Tile, WordleState, phase_of
 
-ONE = Element(id=1, role="button", kind="click", label="One", current_value="")
-FIELD = Element(id=2, role="textbox", kind="fill", label="Query", current_value="")
-SIZE = Element(id=3, role="combobox", kind="select", label="Size -> L", current_value="M", option_value="L")
+CLOSE = Element(id=1, role="button", kind="click", label="Close", current_value="")
 
-GOAL = HumanMessage("Go to https://example.com/start. Then click One.")
+GOAL = HumanMessage("Solve today's Wordle.\n\nStart at https://www.nytimes.com/games/wordle/index.html")
+NYT_URL = "https://www.nytimes.com/games/wordle/index.html"
 
 
-def _snapshot(fingerprint: str) -> Snapshot:
-    return Snapshot(
-        url="https://example.com/start",
-        title="t",
-        text="x",
-        elements=[ONE, FIELD, SIZE],
-        can_scroll_down=True,
-        can_scroll_up=False,
+def _tiles(*specs: tuple[str, str]) -> list[Tile]:
+    return [Tile(letter=letter if letter != " " else "", state=state) for letter, state in specs]
+
+
+def _empty_row() -> list[Tile]:
+    return _tiles(*[(" ", "empty")] * 5)
+
+
+def _state(
+    fingerprint: str,
+    *,
+    rows: list[list[Tile]] | None = None,
+    elements: list[Element] | None = None,
+    dialog_summary: str | None = None,
+    typing: str = "",
+    toast: str | None = None,
+) -> WordleState:
+    rows = rows if rows is not None else [_empty_row() for _ in range(6)]
+    dialog = Dialog(kind="stats", summary=dialog_summary) if dialog_summary else None
+    return WordleState(
+        url=NYT_URL,
+        title="Wordle",
+        rows=rows,
+        keyboard={},
+        typing=typing,
+        phase=phase_of(rows),
+        landing=not rows,
+        dialog=dialog,
+        toast=toast,
+        elements=elements or [],
         fingerprint=fingerprint,
     )
 
 
-def _step(tool: str, args: dict[str, Any], snapshot: Snapshot, *, content: str = "ok", description: str | None = None) -> list[BaseMessage]:
-    call_id = f"call_{tool}_{snapshot.fingerprint}"
+def _step(
+    tool: str,
+    args: dict[str, Any],
+    state: WordleState,
+    *,
+    content: str = "ok",
+    description: str | None = None,
+) -> list[BaseMessage]:
+    call_id = f"call_{tool}_{state.fingerprint}"
     return [
         AIMessage(content=description or tool, tool_calls=[{"name": tool, "args": args, "id": call_id, "type": "tool_call"}]),
-        ToolMessage(content=content, tool_call_id=call_id, artifact=snapshot),
+        ToolMessage(content=content, tool_call_id=call_id, artifact=state),
     ]
 
 
 def _opened(fingerprint: str = "fp0") -> list[BaseMessage]:
-    return [GOAL, *_step("open", {"url": "https://example.com/start"}, _snapshot(fingerprint))]
+    return [GOAL, *_step("open", {"url": NYT_URL}, _state(fingerprint))]
 
 
 def _decide(*decisions: Decision, monkeypatch: pytest.MonkeyPatch, seen: list[list[str]] | None = None) -> None:
     scripted = iter(decisions)
 
-    async def fake(snapshot: Snapshot, goal: str, history: list[str]) -> Decision:
+    async def fake(state: WordleState, guesses: list, candidates_left: int, constraints: str, history: list[str]) -> Decision:
         if seen is not None:
             seen.append(history)
         return next(scripted)
@@ -55,106 +84,134 @@ def _decide(*decisions: Decision, monkeypatch: pytest.MonkeyPatch, seen: list[li
     monkeypatch.setattr(model_module, "adecide", fake)
 
 
-def _run(model: TypeSafeBrowserModel, messages: list[BaseMessage]) -> AIMessage:
+def _run(model: WordleSolverModel, messages: list[BaseMessage]) -> AIMessage:
     result = asyncio.run(model.ainvoke(messages))
     assert isinstance(result, AIMessage)
     return result
 
 
 def test_first_turn_opens_the_url_from_the_goal() -> None:
-    message = _run(TypeSafeBrowserModel(), [GOAL])
-    assert message.tool_calls == [
-        {"name": "open", "args": {"url": "https://example.com/start"}, "id": message.tool_calls[0]["id"], "type": "tool_call"}
+    message = _run(WordleSolverModel(), [GOAL])
+    assert message.tool_calls[0]["name"] == "open"
+    assert message.tool_calls[0]["args"] == {"url": NYT_URL}
+
+
+def test_goal_without_url_opens_nyt_by_default() -> None:
+    message = _run(WordleSolverModel(), [HumanMessage("Solve the puzzle.")])
+    assert message.tool_calls[0]["name"] == "open"
+    assert message.tool_calls[0]["args"] == {"url": NYT_URL}
+
+
+def test_won_board_ends_done_without_a_classifier_call(monkeypatch: pytest.MonkeyPatch) -> None:
+    _decide(monkeypatch=monkeypatch)  # a scripted call would fail: never reached
+    green = _tiles(("s", "correct"), ("l", "correct"), ("a", "correct"), ("t", "correct"), ("e", "correct"))
+    gray = _tiles(("c", "absent"), ("r", "absent"), ("a", "absent"), ("n", "absent"), ("e", "absent"))
+    messages = [GOAL, *_step("open", {"url": NYT_URL}, _state("fp0", rows=[gray, green, *[_empty_row() for _ in range(4)]]))]
+    message = _run(WordleSolverModel(), messages)
+    assert message.tool_calls == []
+    assert message.content == "DONE: solved slate in 2/6."
+
+
+def test_lost_board_ends_lost_and_parses_the_dialog_answer(monkeypatch: pytest.MonkeyPatch) -> None:
+    _decide(monkeypatch=monkeypatch)
+    gray = _tiles(("c", "absent"), ("r", "absent"), ("a", "absent"), ("n", "absent"), ("e", "absent"))
+    messages = [
+        GOAL,
+        *_step("open", {"url": NYT_URL}, _state("fp0", rows=[gray] * 6, dialog_summary="Statistics ... The answer was CRASH.")),
     ]
-    assert message.content == "OPEN https://example.com/start"
+    message = _run(WordleSolverModel(), messages)
+    assert message.content == "LOST: the answer was crash."
 
 
-def test_goal_without_url_is_blocked() -> None:
-    message = _run(TypeSafeBrowserModel(), [HumanMessage("Click One.")])
+def test_typing_row_waits_for_the_reveal(monkeypatch: pytest.MonkeyPatch) -> None:
+    _decide(monkeypatch=monkeypatch)
+    row = _tiles(("w", "tbd"), ("o", "tbd"), ("r", "tbd"), (" ", "empty"), (" ", "empty"))
+    messages = [*_opened(), *_step("type_word", {"word": "worry"}, _state("fp1", rows=[row, *[_empty_row() for _ in range(5)]], typing="wor"))]
+    message = _run(WordleSolverModel(), messages)
+    assert message.tool_calls[0]["name"] == "wait"
+
+
+def test_scripted_guess_becomes_a_type_word_call(monkeypatch: pytest.MonkeyPatch) -> None:
+    _decide(Decision(action="SUBMIT_GUESS", word="slate", confidence=0.8), monkeypatch=monkeypatch)
+    message = _run(WordleSolverModel(), _opened())
+    assert message.tool_calls[0]["name"] == "type_word"
+    assert message.tool_calls[0]["args"] == {"word": "slate"}
+    assert message.content == "SUBMIT_GUESS 'slate'"
+
+
+def test_fallback_guess_is_marked_in_the_description(monkeypatch: pytest.MonkeyPatch) -> None:
+    _decide(Decision(action="SUBMIT_GUESS", word="slate", confidence=0.2, fallback=True), monkeypatch=monkeypatch)
+    message = _run(WordleSolverModel(), _opened())
+    assert message.content == "SUBMIT_GUESS 'slate' (code fallback)"
+
+
+def test_guess_outside_the_dictionary_ends_blocked(monkeypatch: pytest.MonkeyPatch) -> None:
+    _decide(Decision(action="SUBMIT_GUESS", word="qqqqq"), monkeypatch=monkeypatch)
+    message = _run(WordleSolverModel(), _opened())
     assert message.tool_calls == []
     assert message.content.startswith("BLOCKED")
 
 
-def test_done_ends_without_a_tool_call(monkeypatch: pytest.MonkeyPatch) -> None:
-    _decide(Decision(operation="DONE", target=None, confidence=0.9), monkeypatch=monkeypatch)
-    message = _run(TypeSafeBrowserModel(), _opened())
-    assert message.tool_calls == []
-    assert message.content == "DONE"
-
-
-def test_click_becomes_a_click_tool_call(monkeypatch: pytest.MonkeyPatch) -> None:
-    _decide(Decision(operation="CLICK", target=ONE, confidence=0.9), monkeypatch=monkeypatch)
-    message = _run(TypeSafeBrowserModel(), _opened())
+def test_scripted_click_targets_the_element(monkeypatch: pytest.MonkeyPatch) -> None:
+    _decide(Decision(action="CLICK", target=CLOSE, confidence=0.9), monkeypatch=monkeypatch)
+    message = _run(WordleSolverModel(), _opened())
     assert message.tool_calls[0]["name"] == "click"
     assert message.tool_calls[0]["args"] == {"node_id": 1}
-    assert message.content == "CLICK 'One'"
+    assert message.content == "CLICK 'Close'"
 
 
-def test_type_text_uses_the_generated_value(monkeypatch: pytest.MonkeyPatch) -> None:
-    _decide(Decision(operation="TYPE_TEXT", target=FIELD, confidence=0.9), monkeypatch=monkeypatch)
-
-    async def fake_text(*args: Any, **kwargs: Any) -> str:
-        return "hello"
-
-    monkeypatch.setattr(model_module, "agenerate_field_text", fake_text)
-    message = _run(TypeSafeBrowserModel(text_model="openai:gpt-5-mini"), _opened())
-    assert message.tool_calls[0]["name"] == "type_text"
-    assert message.tool_calls[0]["args"] == {"node_id": 2, "value": "hello"}
-    assert message.content == "TYPE_TEXT 'Query' = 'hello'"
-
-
-def test_select_carries_the_option_value(monkeypatch: pytest.MonkeyPatch) -> None:
-    _decide(Decision(operation="SELECT", target=SIZE, confidence=0.9), monkeypatch=monkeypatch)
-    message = _run(TypeSafeBrowserModel(), _opened())
-    assert message.tool_calls[0]["name"] == "select_option"
-    assert message.tool_calls[0]["args"] == {"node_id": 3, "value": "L"}
+def test_starter_bypasses_the_classifier_on_the_first_turn(monkeypatch: pytest.MonkeyPatch) -> None:
+    _decide(monkeypatch=monkeypatch)
+    message = _run(WordleSolverModel(starter="crane"), _opened())
+    assert message.tool_calls[0] == {
+        "name": "type_word",
+        "args": {"word": "crane"},
+        "id": message.tool_calls[0]["id"],
+        "type": "tool_call",
+    }
+    assert "starter" in message.content
 
 
-def test_targetless_operation_calls_its_tool_with_no_args(monkeypatch: pytest.MonkeyPatch) -> None:
-    _decide(Decision(operation="SCROLL_DOWN", target=None, confidence=0.9), monkeypatch=monkeypatch)
-    message = _run(TypeSafeBrowserModel(), _opened())
-    assert message.tool_calls[0]["name"] == "scroll_down"
-    assert message.tool_calls[0]["args"] == {}
-
-
-def test_history_marks_actions_that_changed_nothing(monkeypatch: pytest.MonkeyPatch) -> None:
-    seen: list[list[str]] = []
-    _decide(Decision(operation="DONE", target=None, confidence=0.9), monkeypatch=monkeypatch, seen=seen)
-    messages = [
-        *_opened("fp0"),
-        *_step("click", {"node_id": 1}, _snapshot("fp1"), description="CLICK 'One'"),
-        *_step("click", {"node_id": 1}, _snapshot("fp1"), description="CLICK 'One'"),
+def test_starter_only_applies_to_an_empty_board(monkeypatch: pytest.MonkeyPatch) -> None:
+    _decide(Decision(action="SUBMIT_GUESS", word="slate"), monkeypatch=monkeypatch)
+    played = [
+        list(_tiles(("c", "absent"), ("r", "absent"), ("a", "absent"), ("n", "absent"), ("e", "absent"))),
+        *[_empty_row() for _ in range(5)],
     ]
-    _run(TypeSafeBrowserModel(), messages)
-    assert seen == [["CLICK 'One'", "CLICK 'One' (page did not change)"]]
+    messages = [*_opened("fp0"), *_step("type_word", {"word": "crane"}, _state("fp1", rows=played))]
+    message = _run(WordleSolverModel(starter="crane"), messages)
+    assert message.tool_calls[0]["args"] == {"word": "slate"}
 
 
 def test_three_actions_that_change_nothing_stall(monkeypatch: pytest.MonkeyPatch) -> None:
-    _decide(monkeypatch=monkeypatch)  # any classifier call would exhaust the empty script
+    _decide(monkeypatch=monkeypatch)
     messages = [*_opened("fp0")]
     for _ in range(3):
-        messages += _step("click", {"node_id": 1}, _snapshot("fp0"), description="CLICK 'One'")
-    message = _run(TypeSafeBrowserModel(), messages)
+        messages += _step("click", {"node_id": 1}, _state("fp0", elements=[CLOSE]), description="CLICK 'Close'")
+    message = _run(WordleSolverModel(), messages)
     assert message.tool_calls == []
     assert message.content.startswith("STALLED")
 
 
-def test_wait_breaks_a_no_change_streak(monkeypatch: pytest.MonkeyPatch) -> None:
-    _decide(Decision(operation="CLICK", target=ONE, confidence=0.9), monkeypatch=monkeypatch)
+def test_waits_that_change_nothing_stall_too(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A revealing row settles in well under three long waits — a wait tail that long
+    # means the board is stuck, so waits count toward the no-change streak.
+    _decide(monkeypatch=monkeypatch)
     messages = [*_opened("fp0")]
-    messages += _step("click", {"node_id": 1}, _snapshot("fp0"))
-    messages += _step("wait", {}, _snapshot("fp0"))
-    messages += _step("click", {"node_id": 1}, _snapshot("fp0"))
-    message = _run(TypeSafeBrowserModel(), messages)
-    assert message.tool_calls[0]["name"] == "click"
+    messages += _step("click", {"node_id": 1}, _state("fp0", elements=[CLOSE]))
+    messages += _step("wait", {}, _state("fp0", elements=[CLOSE]))
+    messages += _step("wait", {}, _state("fp0", elements=[CLOSE]))
+    message = _run(WordleSolverModel(), messages)
+    assert message.tool_calls == []
+    assert message.content.startswith("STALLED")
 
 
 def test_repeated_effective_actions_never_stall(monkeypatch: pytest.MonkeyPatch) -> None:
-    _decide(Decision(operation="CLICK", target=ONE, confidence=0.9), monkeypatch=monkeypatch)
+    _decide(Decision(action="CLICK", target=CLOSE, confidence=0.9), monkeypatch=monkeypatch)
     messages = [*_opened("fp0")]
     for i in range(1, 6):
-        messages += _step("click", {"node_id": 1}, _snapshot(f"fp{i}"))
-    message = _run(TypeSafeBrowserModel(), messages)
+        messages += _step("click", {"node_id": 1}, _state(f"fp{i}", elements=[CLOSE]))
+    message = _run(WordleSolverModel(), messages)
     assert message.tool_calls[0]["name"] == "click"
 
 
@@ -162,8 +219,8 @@ def test_same_target_failures_stall(monkeypatch: pytest.MonkeyPatch) -> None:
     _decide(monkeypatch=monkeypatch)
     messages = [*_opened("fp0")]
     for _ in range(3):
-        messages += _step("click", {"node_id": 1}, _snapshot("fp0"), content="failed: occluded")
-    message = _run(TypeSafeBrowserModel(), messages)
+        messages += _step("type_word", {"word": "crane"}, _state("fp0"), content="failed: word rejected by the game")
+    message = _run(WordleSolverModel(), messages)
     assert message.content.startswith("STALLED")
 
 
@@ -171,14 +228,57 @@ def test_step_budget_ends_the_run_blocked(monkeypatch: pytest.MonkeyPatch) -> No
     _decide(monkeypatch=monkeypatch)
     messages = [*_opened("fp0")]
     for i in range(1, 3):
-        messages += _step("click", {"node_id": 1}, _snapshot(f"fp{i}"))
-    message = _run(TypeSafeBrowserModel(max_steps=2), messages)
+        messages += _step("click", {"node_id": 1}, _state(f"fp{i}", elements=[CLOSE]))
+    message = _run(WordleSolverModel(max_steps=2), messages)
     assert message.tool_calls == []
     assert "budget" in message.content
 
 
+def test_history_marks_actions_that_changed_nothing(monkeypatch: pytest.MonkeyPatch) -> None:
+    seen: list[list[str]] = []
+    _decide(Decision(action="WAIT"), monkeypatch=monkeypatch, seen=seen)
+    messages = [
+        *_opened("fp0"),
+        *_step("click", {"node_id": 1}, _state("fp1", elements=[CLOSE]), description="CLICK 'Close'"),
+        *_step("click", {"node_id": 1}, _state("fp1", elements=[CLOSE]), description="CLICK 'Close'"),
+    ]
+    _run(WordleSolverModel(), messages)
+    assert seen == [["CLICK 'Close'", "CLICK 'Close' (page did not change)"]]
+
+
+def test_mid_reveal_board_waits_without_typing(monkeypatch: pytest.MonkeyPatch) -> None:
+    _decide(monkeypatch=monkeypatch)
+    row = _tiles(("c", "absent"), ("r", "absent"), ("a", "tbd"), ("n", "tbd"), ("e", "tbd"))
+    messages = [*_opened(), *_step("type_word", {"word": "crane"}, _state("fp1", rows=[row, *[_empty_row() for _ in range(5)]]))]
+    message = _run(WordleSolverModel(), messages)
+    assert message.tool_calls[0]["name"] == "wait"
+
+
+def test_game_rejected_words_are_never_offered_again(monkeypatch: pytest.MonkeyPatch) -> None:
+    seen_guesses: list[list[str]] = []
+
+    async def fake(state: WordleState, guesses: list, candidates_left: int, constraints: str, history: list[str]) -> Decision:
+        seen_guesses.append([guess.word for guess in guesses])
+        return Decision(action="SUBMIT_GUESS", word="slate", confidence=0.8)
+
+    monkeypatch.setattr(model_module, "adecide", fake)
+    played = [
+        list(_tiles(("c", "absent"), ("r", "absent"), ("a", "absent"), ("n", "absent"), ("e", "absent"))),
+        *[_empty_row() for _ in range(5)],
+    ]
+    messages = [
+        *_opened("fp0"),
+        # The game rejected `crane` (NYT's live dictionary dropped it); it must not
+        # appear in the ranked options the next turn offers.
+        *_step("type_word", {"word": "crane"}, _state("fp1", rows=played), content="failed: word rejected by the game"),
+    ]
+    message = _run(WordleSolverModel(), messages)
+    assert seen_guesses and "crane" not in seen_guesses[0]
+    assert message.tool_calls[0]["args"] == {"word": "slate"}
+
+
 def test_bind_tools_is_accepted_and_sync_generate_is_refused() -> None:
-    model = TypeSafeBrowserModel()
+    model = WordleSolverModel()
     assert model.bind_tools([]) is not None
     with pytest.raises(NotImplementedError, match="async-only"):
         model.invoke([GOAL])

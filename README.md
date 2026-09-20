@@ -1,15 +1,19 @@
-# ts-browser-agent
+# wordle-solver
 
-A fast browser agent built on
+A dedicated NYT Wordle solver, built on
 [`langchain-typesafe`](https://docs.langchain.com/oss/python/integrations/providers/typesafe)
 and the LangChain SDK. No third-party browser-agent package. The loop is LangChain's
-`create_agent`; TypeSafe is the model, and the browser actions are the tools.
+`create_agent`; TypeSafe is the model, and the game actions are the tools.
 
-Here, the agent plays the [Wikipedia Game](https://en.wikipedia.org/wiki/Wikipedia:Wiki_Game), going from [LangChain](https://en.wikipedia.org/wiki/LangChain) to [Microphone](https://en.wikipedia.org/wiki/Microphone):
+The division of labor is the point: **code owns everything deterministic** — reading the
+board DOM, Wordle's constraint rules (greens, yellows, duplicate-letter counting),
+filtering the 2,314-answer list, and ranking guesses by expected remaining candidates.
+**TypeSafe owns the one semantic judgment per turn** — which of the top-ranked candidate
+words is worth playing next — asked in a single batched request alongside speculative
+questions for which button to click. Game-over is an observed all-green row, not a
+model answer, so a win ends the run without spending a request.
 
-<a href="docs/wiki_game.mp4"><img src="docs/wiki_game.gif" alt="A recorded run of examples/wiki_game.py" width="100%" /></a>
-
-## Quickstart: run it in LangSmith Studio
+## Quickstart
 
 1. Install:
 
@@ -18,134 +22,89 @@ Here, the agent plays the [Wikipedia Game](https://en.wikipedia.org/wiki/Wikiped
    uv run playwright install chromium
    ```
 
-2. Add a `.env` based on `.env.example` and fill in your values.
-3. Start the dev server:
+2. Add a `.env` based on `.env.example` with your `TYPESAFE_API_KEY` (no other keys are
+   needed — the solver uses no chat model).
+3. Solve today's puzzle:
 
    ```bash
-   uv run langgraph dev
+   uv run --env-file .env python examples/wordle.py --headed   # watch it play
    ```
 
-   Studio loads two graphs. `browser` is a deep agent that plans and delegates each page
-   to the `browse_fast` tool. `browser_loop` is the browser agent itself, for watching
-   the classifier's decisions one tool call at a time; it holds one browser, so run one
-   goal at a time on it.
+   Drop `--headed` for a headless run. Useful flags:
 
-4. Type a goal. The deep agent plans, hands each page to the `browse_fast` tool, and
-   reports back. Each call opens a visible Chromium.
+   - `--starter crane` — force a fixed opening guess.
+   - `--no-auth` — play logged out.
+   - `--url URL` — point at any Wordle with the same markup (e.g. a clone).
 
-   > Go to https://en.wikipedia.org/wiki/Main_Page and open the article about the
-   > Rosetta Stone. Tell me its first sentence.
+Each run opens a fresh browser, so replays never collide with stored daily progress.
 
-   > Find the cheapest direct flights between Montreal and Cancun for a Saturday-to-Saturday
-   > trip between December 2026 and February 2027.
+## Playing on your NYT account
 
-## Why `langchain-typesafe`
+Logged-out runs solve fine but record nothing. To have solves and streaks count, drop a
+raw `Cookie:` header line from a signed-in nytimes.com session into
+`.auth/nyt-cookies.txt` (gitignored — see `.gitignore`). The solver installs those
+cookies and pins the matching user agent, since DataDome ties its anti-bot token to the
+fingerprint that minted it.
 
-`TypeSafeClassifier` answers categorical questions about a JSON payload in one request.
-It returns probabilities over answers you offered, not generated text. A browser step
-fits: which operation, and which element. Trimmed from `decision.py`:
-
-```python
-from langchain_typesafe import Choice, TypeSafeClassifier
-
-classifier = TypeSafeClassifier(
-    questions={
-        "operation": Choice(
-            instructions="Advance the goal from the current page using one operation.",
-            criteria={"CLICK": "Click an element.", "TYPE_TEXT": "Type into a field.", "DONE": "..."},
-        ),
-        "click_target": Choice(
-            instructions="Choose the best target if the next operation is CLICK.",
-            criteria={"14": {"label": "Where to?"}, "21": {"label": "Cancún, Mexico"}},
-        ),
-    }
-)
-response = classifier.invoke({"goal": goal, "page": page, "elements": elements})
-response.choices["operation"].choice            # "CLICK"
-response.choices["click_target"].probabilities  # {"21": 0.91, "14": 0.09}
-```
-
-`TypeSafeBrowserModel` wraps that call as a chat model: each turn it reads the page from
-the last tool result and answers with one tool call, so `create_agent` runs it as it
-would any model.
-
-Docs: [provider guide](https://docs.langchain.com/oss/python/integrations/providers/typesafe)
-· [API reference](https://reference.langchain.com/python/integrations/langchain_typesafe/)
-· [TypeSafe docs](https://docs.typesafe.ai/introduction)
-· [speculative fan-out pattern](https://docs.typesafe.ai/patterns/fan-out)
-· [PyPI](https://pypi.org/project/langchain-typesafe/)
-
-## Use it as a utility
-
-Both Studio graphs are importable pieces.
-
-### Wrap `browse_fast` in your own deep agent
-
-`make_browse_fast_tool()` returns a LangChain tool for `create_agent` or
-`create_deep_agent`.
-
-```python
-from deepagents import create_deep_agent
-from ts_browser_agent import make_browse_fast_tool
-
-browse_fast = make_browse_fast_tool()  # headless=True, allow_private=False by default
-agent = create_deep_agent(model="openai:gpt-5.5", tools=[browse_fast])
-await agent.ainvoke({"messages": [("user", "Find the pricing page and summarize the tiers.")]})
-```
-
-A call returns a status line plus the final page's visible text, so the caller can read
-a price or a title from it. `headless`, `allow_private`, and `text_model` are fixed
-when the tool is built; they are not tool arguments. Each call builds its own browser
-agent, so parallel calls do not share a browser.
-
-`url` comes from a model, so the `open` tool checks it with `ensure_navigable` before
-any browser launches.
-
-See `examples/deep_agent.py`.
-
-### Build the browser agent
-
-`build_browser_agent()` returns the compiled `create_agent` graph. It is async-only:
-drive it with `ainvoke` or `astream`.
-
-```python
-import asyncio
-from ts_browser_agent import build_browser_agent
-
-agent = build_browser_agent()
-goal = "Open the article about the Rosetta Stone.\n\nStart at https://en.wikipedia.org/wiki/Main_Page"
-result = asyncio.run(agent.ainvoke({"messages": [("user", goal)]}))
-print(result["messages"][-1].content)  # "DONE", "BLOCKED", or "STALLED: ..."
-```
-
-Name the start URL at the end of the goal. The classifier weighs the goal's opening
-heavily, and a goal that opens with the start page reads as anchored to it once the
-agent has moved on. `DONE` is the classifier's judgment, not a guarantee; verify before
-acting on it. Options: `max_steps`, `headless`, `allow_private` (permits a local dev
-server), and `snapshot_filter`, a hook applied to every observation before the model
-sees it — `examples/wiki_game.py` uses it to enforce the game's rules.
-
-## Examples
-
-Every example opens a visible browser so you can watch.
-
-| Example | Path | What it exercises |
-| --- | --- | --- |
-| `flight_search.py` | agent | A long click/select chain on real dynamic UI (Google Flights). Search only; it never books |
-| `github_issue.py` | agent | Structurally different UI at each step (tab, filter, list, issue) |
-| `wiki_hop.py` | agent | The same decision (first link in body text) made correctly many times in a row |
-| `wiki_game.py` | agent | Reach one article from another (`--start`, `--end`). The game's rules live in a `snapshot_filter`: no revisits, article links only, no search |
-| `deep_agent.py` | deep agent | The minimal shape: one `browse_fast` call, one page-scoped goal |
+## LangSmith Studio
 
 ```bash
-uv run --env-file .env python examples/wiki_game.py --start "Jimmy Page" --end Microphone
+uv run langgraph dev
 ```
 
-## Credits
+loads the `wordle` graph for watching decisions one tool call at a time; it holds one
+browser, so run one puzzle at a time.
 
-The design follows [jev-ultrafast](https://github.com/browser-use/jev-ultrafast) by
-Browser Use: one TypeSafe request per step, a small model for typed text only, no LLM
-reasoning per click. The instruction text in `decision.py` is adapted from it under the
-MIT license. The implementation is independent — Playwright rather than Browser
-Harness, `langchain-typesafe` rather than a custom client, and LangChain's
-`create_agent` as the loop.
+## How a run works
+
+One step, one batched TypeSafe request:
+
+1. The `open` tool launches Chromium at the NYT Wordle page (an indexed element snapshot
+   plus a board read come back as the tool result's artifact).
+2. `WordleSolverModel` reads the `WordleState`: rows of tiles with `correct`/`present`/
+   `absent` feedback, keyboard colors, any dialog, any half-typed row.
+3. Observed facts short-circuit first: a half-typed row means the previous guess is
+   mid-reveal, so it waits; a won or lost board ends the run (`DONE: solved X in N/6`
+   or `LOST: the answer was X`).
+4. Otherwise the code side filters the answer list against every revealed row and ranks
+   candidate guesses by expected remaining candidates, then TypeSafe answers three
+   questions at once — `action` (submit a guess / click a button / wait / blocked),
+   speculatively `guess` (one of the top-ranked words, with each candidate's
+   `expected_remaining` and `possible_answer` flag as criteria), and speculatively
+   `click_target` (a dialog's close button, the landing screen's play button). Only the
+   head matching the answered action is read; a `guess` answer outside the offered
+   options falls back to the code-ranked best word.
+5. The tool acts — `type_word` clears any stale row, types, submits, and polls until the
+   row's tiles leave the `tbd` state (~1.7 s of flip animation) — and the next state
+   comes back as the artifact.
+
+Stall guards stop wasted steps: three actions that change nothing, or three failures on
+the same target, end the run `STALLED`; a 24-action budget ends it `BLOCKED`. Either
+way the browser is closed by middleware on every exit path.
+
+## Layout
+
+```
+src/wordle_solver/
+  wordlist.py   # the answer/allowed lists, feedback simulation, constraint filter, ranking
+  wordle.py     # WordleState + the one-evaluate board/keyboard/dialog reader
+  browser.py    # Playwright execution: re-validated clicks, type_word with settle polling
+  decision.py   # the batched TypeSafe request (action + speculative guess/click_target)
+  model.py      # WordleSolverModel: the policy as a BaseChatModel
+  tools.py      # open/click/type_word/wait + BrowserSession + CloseBrowser middleware
+  agent.py      # build_wordle_agent: create_agent with no loop code
+  auth.py       # NYT cookie file → Playwright storage state
+  snapshot.py   # generic indexed DOM snapshot (installs the click node map)
+  safety.py     # SSRF guard for the opened URL
+data/           # wordle-answers.txt (2,314) + wordle-allowed-guesses.txt (10,656)
+```
+
+## Tests
+
+Everything runs offline against fakes — no browser, no network, no TypeSafe request:
+
+```bash
+uv run pytest
+uv run ruff check src tests examples
+uv run mypy src
+```

@@ -4,22 +4,47 @@ from __future__ import annotations
 
 from langchain_typesafe.types import ChoiceAnswer
 
-from ts_browser_agent.decision import build_classifier, resolve_decision
-from ts_browser_agent.snapshot import Element, Snapshot
+from wordle_solver.decision import build_classifier, resolve_decision
+from wordle_solver.snapshot import Element
+from wordle_solver.wordle import Tile, WordleState
+from wordle_solver.wordlist import RankedGuess
 
-CLICK = Element(id=1, role="button", kind="click", label="Submit", current_value="")
-FILL = Element(id=2, role="textbox", kind="fill", label="Query", current_value="abc")
-SELECT = Element(id=3, role="combobox", kind="select", label="Size -> L", current_value="M", option_value="L")
+CLOSE = Element(id=1, role="button", kind="click", label="Close", current_value="")
+PLAY = Element(id=2, role="button", kind="click", label="Play", current_value="")
+
+CRANE = RankedGuess("crane", expected_remaining=10.5, is_possible_answer=True)
+SLATE = RankedGuess("slate", expected_remaining=8.2, is_possible_answer=False)
 
 
-def _snapshot(elements: list[Element], *, down: bool = False, up: bool = False) -> Snapshot:
-    return Snapshot(
-        url="https://example.com/",
-        title="Example",
-        text="hello",
-        elements=elements,
-        can_scroll_down=down,
-        can_scroll_up=up,
+def _tiles(*specs: tuple[str, str]) -> list[Tile]:
+    return [Tile(letter=letter if letter != " " else "", state=state) for letter, state in specs]
+
+
+EMPTY_ROW = _tiles(*[(" ", "empty")] * 5)
+
+
+def _state(
+    *,
+    rows: list[list[Tile]] | None = None,
+    elements: list[Element] | None = None,
+    dialog_summary: str | None = None,
+    typing: str = "",
+) -> WordleState:
+    from wordle_solver.wordle import Dialog, phase_of
+
+    rows = rows if rows is not None else [list(EMPTY_ROW) for _ in range(6)]
+    dialog = Dialog(kind="how_to_play", summary=dialog_summary) if dialog_summary else None
+    return WordleState(
+        url="https://www.nytimes.com/games/wordle/index.html",
+        title="Wordle",
+        rows=rows,
+        keyboard={},
+        typing=typing,
+        phase=phase_of(rows),
+        landing=not rows,
+        dialog=dialog,
+        toast=None,
+        elements=elements or [],
         fingerprint="fp",
     )
 
@@ -28,63 +53,74 @@ def _answer(choice: str, *, confidence: float = 0.9) -> ChoiceAnswer:
     return ChoiceAnswer(type="choice", choice=choice, probabilities={choice: 1.0}, confidence=confidence)
 
 
-def test_only_operations_with_candidates_are_offered() -> None:
-    classifier, _ = build_classifier(_snapshot([CLICK]))
-    operations = classifier.questions["operation"]
-    assert set(operations.criteria) == {"CLICK", "WAIT", "DONE", "BLOCKED"}  # type: ignore[union-attr]
-    assert set(classifier.questions) == {"operation", "click_target"}
+def test_fresh_board_offers_guess_without_a_target_question() -> None:
+    classifier, click_candidates, words = build_classifier(_state(), [CRANE, SLATE], 200, "No feedback yet.")
+    assert set(classifier.questions) == {"action", "guess"}
+    assert set(classifier.questions["action"].criteria) == {"SUBMIT_GUESS", "WAIT", "BLOCKED"}  # type: ignore[union-attr]
+    assert click_candidates == {}
+    assert set(words) == {"crane", "slate"}
 
 
-def test_scroll_operations_follow_scroll_flags() -> None:
-    classifier, _ = build_classifier(_snapshot([], down=True, up=True))
-    operations = classifier.questions["operation"]
-    assert set(operations.criteria) == {"SCROLL_UP", "SCROLL_DOWN", "WAIT", "DONE", "BLOCKED"}  # type: ignore[union-attr]
-    assert set(classifier.questions) == {"operation"}
+def test_dialog_offers_click_and_keeps_the_guess_speculative() -> None:
+    state = _state(elements=[CLOSE], dialog_summary="How To Play ...")
+    classifier, click_candidates, _ = build_classifier(state, [CRANE], 200, "digest")
+    assert set(classifier.questions) == {"action", "click_target", "guess"}
+    assert "SUBMIT_GUESS" not in set(classifier.questions["action"].criteria)  # type: ignore[union-attr]
+    assert set(click_candidates) == {"1"}
+    assert classifier.questions["click_target"].criteria == {"1": {"label": "Close", "role": "button"}}  # type: ignore[union-attr]
 
 
-def test_every_present_kind_gets_a_speculative_target_question() -> None:
-    classifier, targets = build_classifier(_snapshot([CLICK, FILL, SELECT]))
-    assert set(classifier.questions) == {"operation", "click_target", "type_text_target", "select_target"}
-    assert classifier.questions["type_text_target"].criteria == {  # type: ignore[union-attr]
-        "2": {"label": "Query", "current_value": "abc"}
-    }
-    assert set(targets["SELECT"]) == {"3:L"}
+def test_landing_screen_disallows_submit() -> None:
+    classifier, _, _ = build_classifier(_state(rows=[], elements=[PLAY]), [CRANE], 2314, "No feedback yet.")
+    assert "SUBMIT_GUESS" not in set(classifier.questions["action"].criteria)  # type: ignore[union-attr]
+    assert "CLICK" in set(classifier.questions["action"].criteria)  # type: ignore[union-attr]
 
 
-def test_resolve_reads_only_the_head_matching_the_operation() -> None:
-    _, targets = build_classifier(_snapshot([CLICK, FILL]))
+def test_guess_criteria_carry_the_ranking_statistics() -> None:
+    classifier, _, _ = build_classifier(_state(), [CRANE, SLATE], 200, "digest")
+    criteria = classifier.questions["guess"].criteria  # type: ignore[union-attr]
+    assert criteria["crane"] == {"expected_remaining": 10.5, "possible_answer": True}
+    assert criteria["slate"]["possible_answer"] is False  # type: ignore[index]
+
+
+def test_no_candidates_drops_the_guess_question() -> None:
+    classifier, _, words = build_classifier(_state(), [], 0, "digest")
+    assert "guess" not in classifier.questions
+    assert "SUBMIT_GUESS" not in set(classifier.questions["action"].criteria)  # type: ignore[union-attr]
+    assert words == {}
+
+
+def test_resolve_submit_reads_the_guess_answer() -> None:
+    answers = {"action": _answer("SUBMIT_GUESS"), "guess": _answer("slate", confidence=0.8)}
+    decision = resolve_decision(answers, {}, {"crane": CRANE, "slate": SLATE})
+    assert decision.action == "SUBMIT_GUESS"
+    assert decision.word == "slate"
+    assert decision.confidence == 0.8
+    assert decision.fallback is False
+
+
+def test_resolve_submit_falls_back_to_the_top_ranked_word() -> None:
+    answers = {"action": _answer("SUBMIT_GUESS"), "guess": _answer("banana")}
+    decision = resolve_decision(answers, {}, {"crane": CRANE, "slate": SLATE})
+    assert decision.word == "slate"  # lowest expected_remaining wins the fallback
+    assert decision.fallback is True
+
+
+def test_resolve_click_reads_its_target_head() -> None:
     answers = {
-        "operation": _answer("CLICK", confidence=0.4),
+        "action": _answer("CLICK", confidence=0.4),
         "click_target": _answer("1", confidence=0.95),
-        "type_text_target": _answer("2", confidence=0.99),
+        "guess": _answer("crane"),
     }
-    decision = resolve_decision(answers, targets)
-    assert decision.operation == "CLICK"
-    assert decision.target is CLICK
+    decision = resolve_decision(answers, {"1": CLOSE}, {"crane": CRANE})
+    assert decision.action == "CLICK"
+    assert decision.target is CLOSE
     assert decision.confidence == 0.95
+    assert decision.word is None
 
 
-def test_resolve_targetless_operation_uses_operation_confidence() -> None:
-    _, targets = build_classifier(_snapshot([CLICK], down=True))
-    decision = resolve_decision({"operation": _answer("SCROLL_DOWN", confidence=0.7)}, targets)
-    assert decision.operation == "SCROLL_DOWN"
+def test_resolve_wait_carries_no_target() -> None:
+    decision = resolve_decision({"action": _answer("WAIT", confidence=0.6)}, {}, {})
+    assert decision.action == "WAIT"
     assert decision.target is None
-    assert decision.confidence == 0.7
-
-
-def test_resolve_select_target_carries_option_value() -> None:
-    _, targets = build_classifier(_snapshot([SELECT]))
-    answers = {"operation": _answer("SELECT"), "select_target": _answer("3:L")}
-    decision = resolve_decision(answers, targets)
-    assert decision.target is not None
-    assert decision.target.option_value == "L"
-
-
-def test_link_href_is_offered_and_non_links_carry_none() -> None:
-    link = Element(id=4, role="button", kind="click", label="Microphone", current_value="", href="/wiki/Microphone")
-    anchor = Element(id=5, role="button", kind="click", label="5 Equipment", current_value="", href="#Equipment")
-    classifier, _ = build_classifier(_snapshot([CLICK, link, anchor]))
-    criteria = classifier.questions["click_target"].criteria  # type: ignore[union-attr]
-    assert criteria["4"] == {"label": "Microphone", "current_value": "", "href": "/wiki/Microphone"}
-    assert criteria["5"]["href"] == "#Equipment"  # type: ignore[index]
-    assert "href" not in criteria["1"]  # type: ignore[operator]
+    assert decision.confidence == 0.6

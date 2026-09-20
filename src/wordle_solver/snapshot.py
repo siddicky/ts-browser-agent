@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Callable
 from typing import Any, Literal
 
 from pydantic import BaseModel
@@ -93,7 +94,7 @@ _SNAPSHOT_JS = r"""
   // list the agent can see but never has a way to click.
   const elements = [];
   const selector =
-    "a[href],button,input,textarea,select," +
+    "a[href],button:not([data-key]),input,textarea,select," +
     "[role='button'],[role='link'],[role='option'],[role='menuitem']," +
     "[role='menuitemradio'],[role='menuitemcheckbox'],[role='tab']," +
     "[role='checkbox'],[role='radio'],[role='switch']";
@@ -191,6 +192,9 @@ class Snapshot(BaseModel):
         return {el.target_key: el for el in self.elements if el.kind == kind}
 
 
+SnapshotFilter = Callable[[Snapshot], Snapshot]
+
+
 def _fingerprint(payload: dict[str, Any]) -> str:
     encoded = json.dumps(payload, sort_keys=True, default=str).encode()
     return hashlib.sha256(encoded).hexdigest()
@@ -221,4 +225,4 @@ async def aread_snapshot(page: Any) -> Snapshot:
     )
 
 
-__all__ = ["Element", "Snapshot", "aread_snapshot"]
+__all__ = ["Element", "Snapshot", "SnapshotFilter", "aread_snapshot"]
