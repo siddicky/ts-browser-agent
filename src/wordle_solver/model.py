@@ -241,9 +241,13 @@ class WordleSolverModel(BaseChatModel):
             # today's puzzle recorded; nothing productive is left to do.
             return AIMessage(content="BLOCKED: today's puzzle was already played on this account.")
 
-        # Tiles mid-typing or mid-flip mean the previous submit is still being judged.
-        if state.typing or state.revealing:
+        # Mid-reveal rows are the previous submit still being judged — wait it out.
+        if state.revealing:
             return _call("wait", {}, content="WAIT — a guess is mid-reveal")
+        # Letters sitting unjudged past a settle are stale (a restored session board,
+        # for example) — clear them so the row is playable again.
+        if state.typing:
+            return _call("clear_row", {}, content=f"CLEAR_ROW {state.typing!r}")
 
         # Starting the game from the landing screen is a launch fact, not a judgment:
         # click Play as soon as the interstitial shows it. On the already-played
@@ -263,6 +267,14 @@ class WordleSolverModel(BaseChatModel):
 
         revealed = state.revealed_rows()
         candidates = filter_candidates(answers(), revealed)
+        # Archive puzzles can have answers outside the vendored (era-2023) list, which
+        # makes exact filtering eventually contradict the board. Degrade gracefully:
+        # drop the oldest rows' constraints until some listed words fit again.
+        ignored = 0
+        while not candidates and revealed:
+            revealed = revealed[1:]
+            ignored += 1
+            candidates = filter_candidates(answers(), revealed)
         # Words the game itself rejected are not in NYT's live dictionary even if the
         # vendored list disagrees — never offer them again.
         rejected = {
@@ -273,6 +285,8 @@ class WordleSolverModel(BaseChatModel):
         ranked_pool = rank_guesses(candidates, top_k=self.top_k + len(rejected))
         ranked = [guess for guess in ranked_pool if guess.word not in rejected][: self.top_k]
         constraints = constraint_summary(revealed)
+        if ignored:
+            constraints += f" ({ignored} oldest row(s) ignored: no listed answer fits the full board.)"
 
         decision = await adecide(state, ranked, len(candidates), constraints, history)
         if decision.action == "SUBMIT_GUESS":

@@ -132,6 +132,9 @@ class FakeBrowser:
             self.page.version += 1
         return True
 
+    async def clear_row(self) -> None:
+        return None
+
     async def close(self) -> None:
         self.closed = True
 

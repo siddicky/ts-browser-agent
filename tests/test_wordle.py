@@ -167,4 +167,5 @@ def test_phase_of_rejects_nothing_on_partial_boards() -> None:
 
 def test_parse_answer_extracts_the_revealed_word() -> None:
     assert parse_answer("Statistics ... The answer was CRASH.") == "crash"
+    assert parse_answer("The word was CRASH.") == "crash"
     assert parse_answer("no answer here") is None

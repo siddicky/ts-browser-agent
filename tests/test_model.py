@@ -123,12 +123,15 @@ def test_lost_board_ends_lost_and_parses_the_dialog_answer(monkeypatch: pytest.M
     assert message.content == "LOST: the answer was crash."
 
 
-def test_typing_row_waits_for_the_reveal(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_stale_typed_row_is_cleared_not_waited_on(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Letters sitting unjudged past type_word's own settle are stale — a restored
+    # session board, typically — and only clearing the row makes it playable again.
     _decide(monkeypatch=monkeypatch)
     row = _tiles(("w", "tbd"), ("o", "tbd"), ("r", "tbd"), (" ", "empty"), (" ", "empty"))
     messages = [*_opened(), *_step("type_word", {"word": "worry"}, _state("fp1", rows=[row, *[_empty_row() for _ in range(5)]], typing="wor"))]
     message = _run(WordleSolverModel(), messages)
-    assert message.tool_calls[0]["name"] == "wait"
+    assert message.tool_calls[0]["name"] == "clear_row"
+    assert "wor" in message.content
 
 
 def test_scripted_guess_becomes_a_type_word_call(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -150,6 +153,33 @@ def test_guess_outside_the_dictionary_ends_blocked(monkeypatch: pytest.MonkeyPat
     message = _run(WordleSolverModel(), _opened())
     assert message.tool_calls == []
     assert message.content.startswith("BLOCKED")
+
+
+def test_contradictory_board_degrades_by_dropping_oldest_rows(monkeypatch: pytest.MonkeyPatch) -> None:
+    # An archive answer outside the vendored list eventually makes exact filtering
+    # impossible; the solver must keep playing on the newest rows, not block.
+    seen: list[tuple[int, str]] = []
+
+    async def fake(state: WordleState, guesses: list, candidates_left: int, constraints: str, history: list[str]) -> Decision:
+        seen.append((candidates_left, constraints))
+        return Decision(action="SUBMIT_GUESS", word="slate", confidence=0.8)
+
+    monkeypatch.setattr(model_module, "adecide", fake)
+    # crane green at c with r yellow, then crane fully gray: no answer satisfies both.
+    green_c = _tiles(("c", "correct"), ("r", "present"), ("a", "absent"), ("n", "absent"), ("e", "absent"))
+    all_absent = _tiles(("c", "absent"), ("r", "absent"), ("a", "absent"), ("n", "absent"), ("e", "absent"))
+    rows = [green_c, all_absent, *[_empty_row() for _ in range(4)]]
+    messages = [
+        *_opened("fp0"),
+        *_step("type_word", {"word": "crane"}, _state("fp1", rows=rows)),
+    ]
+    message = _run(WordleSolverModel(), messages)
+    candidates_left, constraints = seen[-1]
+    assert message.tool_calls[0]["args"] == {"word": "slate"}
+    # The all-green row (answer crane) and the c-absent row cannot both hold; the
+    # solver dropped constraints until candidates existed again.
+    assert candidates_left > 0
+    assert "oldest row(s) ignored" in constraints
 
 
 def test_scripted_click_targets_the_element(monkeypatch: pytest.MonkeyPatch) -> None:

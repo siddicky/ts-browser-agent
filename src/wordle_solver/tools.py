@@ -140,6 +140,12 @@ def wordle_tools(session: BrowserSession) -> list[BaseTool]:
         return await report("failed: the board did not settle after the guess")
 
     @tool(response_format="content_and_artifact")
+    async def clear_row() -> tuple[str, WordleState]:
+        """Backspace any half-typed letters out of the active row."""
+        await session.require().clear_row()
+        return await report("ok")
+
+    @tool(response_format="content_and_artifact")
     async def wait() -> tuple[str, WordleState]:
         """Wait for the board to settle; longer while a row is mid-reveal."""
         state = await session.observe()
@@ -148,7 +154,7 @@ def wordle_tools(session: BrowserSession) -> list[BaseTool]:
             await asyncio.sleep(1.4)
         return await report("ok")
 
-    return [open_page, click, type_word, wait]
+    return [open_page, click, type_word, clear_row, wait]
 
 
 class CloseBrowser(AgentMiddleware[AgentState[Any], Any, Any]):

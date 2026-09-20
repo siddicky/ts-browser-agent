@@ -64,23 +64,19 @@ _RESOLVE_AND_CLICK_JS = r"""
 }
 """
 
-# The light poll `type_word` settles on: just the active row's letters and states plus
-# the toast text and dialog presence — the full board read waits until settling is done.
-_ACTIVE_ROW_JS = r"""
+# The light poll `type_word` settles on: every row's tile states plus the toast text
+# and dialog presence — the submitted row is tracked by index, because once it
+# finishes flipping the "active row" pointer moves to the next row.
+_ROW_STATES_JS = r"""
 () => {
-  const rows = [...document.querySelectorAll("[class*='Row-module_row']")];
-  const active = rows.find((row) =>
-    [...row.querySelectorAll("[data-testid='tile']")].some(
-      (tile) => !["correct", "present", "absent"].includes(tile.getAttribute("data-state")),
-    ),
+  const rows = [...document.querySelectorAll("[class*='Row-module_row']")].map((row) =>
+    [...row.querySelectorAll("[data-testid='tile']")].map((tile) => tile.getAttribute("data-state") || "empty"),
   );
-  const tiles = active ? [...active.querySelectorAll("[data-testid='tile']")] : [];
   const toastEl = document.querySelector("[id*='toaster' i] section, [class*='toast' i]");
   return {
-    letters: tiles.map((tile) => (tile.textContent || "").trim().toLowerCase()),
-    states: tiles.map((tile) => tile.getAttribute("data-state") || "empty"),
+    rows,
     toast: toastEl ? (toastEl.textContent || "").trim() : "",
-    dialog: !!document.querySelector("dialog[open]"),
+    dialog: !!document.querySelector("dialog[open], [class*='modalOverlay' i]"),
   };
 }
 """
@@ -176,8 +172,9 @@ class AsyncBrowser:
         presses are spaced out and the row is re-read until it is actually empty.
         """
         for _ in range(3):
-            raw = await self.page.evaluate(_ACTIVE_ROW_JS)
-            if all(state == "empty" for state in raw["states"]):
+            raw = await self.page.evaluate(_ROW_STATES_JS)
+            active = next((row for row in raw["rows"] if not all(state in _REVEALED for state in row)), None)
+            if active is None or all(state == "empty" for state in active):
                 return
             for _ in range(5):
                 await self.page.keyboard.press("Backspace")
@@ -187,27 +184,30 @@ class AsyncBrowser:
     async def type_word(self, word: str) -> TypeWordResult:
         """Type a five-letter guess, submit it, and wait for the row to be judged.
 
-        The board ignores keys while a reveal animation or a dialog owns it, so the
-        submission is only trusted once the active row's tiles all carry real feedback
-        (~1.7 s of flip animation). A rejected word (not in NYT's list) shows a toast
-        and leaves the tiles `tbd`; the row is cleared so the next decision starts
-        clean. A stale toast from an earlier rejection is ignored by matching the
-        toast's text.
+        The submitted row is tracked by index: once its flip animation finishes, the
+        game's "active row" pointer moves on, so watching the active row would never
+        see the verdict. A rejected word (not in NYT's list) shows a toast and leaves
+        the tiles `tbd`; the row is cleared so the next decision starts clean. A stale
+        toast from an earlier rejection is ignored by matching the toast's text.
 
         Returns:
             `"accepted"`, `"rejected"`, or `"unknown"` (no verdict within the timeout).
         """
+        board = await self.page.evaluate(_ROW_STATES_JS)
+        target = sum(1 for row in board["rows"] if all(state in _REVEALED for state in row))
         await self.clear_row()
         await self.page.keyboard.type(word, delay=40)
         await self.page.keyboard.press("Enter")
         for _ in range(40):  # ~6 s: five tiles' flip animation plus slack
-            raw = await self.page.evaluate(_ACTIVE_ROW_JS)
-            states = raw["states"]
-            if len(states) == 5 and all(state in _REVEALED for state in states):
+            board = await self.page.evaluate(_ROW_STATES_JS)
+            row = board["rows"][target] if target < len(board["rows"]) else None
+            if row is not None and len(row) == 5 and all(state in _REVEALED for state in row):
                 return "accepted"
-            if raw["dialog"]:
+            if board["dialog"]:
                 return "accepted"  # a stats dialog after a win/loss means the guess landed
-            if _INVALID_WORD_RE.search(raw["toast"]) and all(state in ("tbd", "empty") for state in states):
+            if _INVALID_WORD_RE.search(board["toast"]) and row is not None and all(
+                state in ("tbd", "empty") for state in row
+            ):
                 await self.clear_row()
                 return "rejected"
             await self.page.wait_for_timeout(150)

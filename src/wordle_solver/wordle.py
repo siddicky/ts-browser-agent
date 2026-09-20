@@ -25,7 +25,7 @@ Phase = Literal["playing", "won", "lost"]
 DialogKind = Literal["how_to_play", "stats", "login", "other"]
 
 _REVEALED = (CORRECT, PRESENT, ABSENT)
-_ANSWER_RE = re.compile(r"the answer was\s+([a-z]{5})\b", re.IGNORECASE)
+_ANSWER_RE = re.compile(r"(?:the\s+)?(?:answer|word)\s+(?:was|is)\s+([a-z]{5})\b", re.IGNORECASE)
 
 # The modal sometimes renders as a native `<dialog open>` and sometimes as a plain
 # div overlay (A/B variants), so both forms are detected.
